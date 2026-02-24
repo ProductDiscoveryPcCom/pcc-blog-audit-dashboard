@@ -18,6 +18,28 @@ st.set_page_config(
 )
 
 # ══════════════════════════════════════════════════════════════
+# AUTHENTICATION — Simple password
+# In Streamlit Secrets add: APP_PASSWORD = "your_password"
+# ══════════════════════════════════════════════════════════════
+if 'authenticated' not in st.session_state:
+    st.session_state['authenticated'] = False
+
+if not st.session_state['authenticated']:
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        st.markdown("")
+        st.markdown("### 🔍 Blog Audit — PcComponentes")
+        st.markdown("")
+        password = st.text_input("Contraseña", type="password")
+        if st.button("Entrar", use_container_width=True):
+            if password == st.secrets.get("APP_PASSWORD", ""):
+                st.session_state['authenticated'] = True
+                st.rerun()
+            else:
+                st.error("❌ Contraseña incorrecta")
+    st.stop()
+
+# ══════════════════════════════════════════════════════════════
 # CUSTOM CSS
 # ══════════════════════════════════════════════════════════════
 st.markdown("""
@@ -93,6 +115,9 @@ with st.sidebar:
     st.image("https://upload.wikimedia.org/wikipedia/commons/1/14/PcComponentes_logo.png", width=180)
     st.markdown("### 🔍 Blog Audit Dashboard")
     st.caption(f"Última actualización de datos: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+    if st.button("🚪 Cerrar sesión"):
+        st.session_state['authenticated'] = False
+        st.rerun()
     st.markdown("---")
 
     # Filters
