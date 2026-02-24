@@ -100,7 +100,9 @@ def load_data():
 try:
     df, df_alerts = load_data()
 except Exception as e:
-    st.error(f"❌ Error conectando con Google Sheets: {e}")
+    st.error(f"❌ Error conectando con Google Sheets: {type(e).__name__}: {e}")
+    import traceback
+    st.code(traceback.format_exc())
     st.info("Configura `SPREADSHEET_ID` y `GCP_SERVICE_ACCOUNT` en Settings → Secrets")
     st.stop()
 
