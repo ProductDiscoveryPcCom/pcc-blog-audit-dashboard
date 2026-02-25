@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
+import altair as alt
 import gspread
 from google.oauth2.service_account import Credentials
 import json
@@ -47,16 +46,6 @@ LOGIN_LOCKOUT_SECONDS = 300
 # ══════════════════════════════════════════════════════════════
 # UTILITY FUNCTIONS
 # ══════════════════════════════════════════════════════════════
-def parse_bool(value):
-    """Convert various truthy string representations to Python bool."""
-    return str(value).strip().upper() in TRUTHY_VALUES
-
-
-def non_empty_mask(series):
-    """Return a boolean mask filtering out empty/whitespace-only strings."""
-    return series.astype(str).str.strip() != ""
-
-
 def hash_password(password: str) -> str:
     """Hash a password using SHA-256."""
     return hashlib.sha256(password.encode()).hexdigest()
@@ -153,13 +142,13 @@ METABASE_CSS = """
         font-size: 0.8rem !important;
     }
 
-    /* === TABS — Metabase-style top nav === */
-    .stTabs [data-baseweb="tab-list"] {
+    /* === NAV RADIO — styled like Metabase tabs === */
+    div[data-testid="stRadio"] > div {
+        flex-direction: row;
         gap: 0;
         border-bottom: 2px solid #E8ECF0;
-        background-color: transparent;
     }
-    .stTabs [data-baseweb="tab"] {
+    div[data-testid="stRadio"] > div > label {
         padding: 10px 20px;
         font-weight: 500;
         font-size: 0.9rem;
@@ -167,17 +156,19 @@ METABASE_CSS = """
         border-bottom: 2px solid transparent;
         margin-bottom: -2px;
         background-color: transparent;
+        cursor: pointer;
     }
-    .stTabs [data-baseweb="tab"]:hover {
+    div[data-testid="stRadio"] > div > label:hover {
         color: #4C9AFF;
     }
-    .stTabs [aria-selected="true"] {
+    div[data-testid="stRadio"] > div > label[data-checked="true"] {
         color: #4C9AFF !important;
         border-bottom: 2px solid #4C9AFF !important;
         font-weight: 600;
     }
-    .stTabs [data-baseweb="tab-panel"] {
-        padding-top: 1.2rem;
+    /* Hide the radio circle */
+    div[data-testid="stRadio"] > div > label > div:first-child {
+        display: none;
     }
 
     /* === DATAFRAMES === */
@@ -187,8 +178,8 @@ METABASE_CSS = """
         overflow: hidden;
     }
 
-    /* === PLOTLY CHARTS container === */
-    .stPlotlyChart {
+    /* === CHART containers === */
+    .stVegaLiteChart {
         border: 1px solid #E8ECF0;
         border-radius: 8px;
         padding: 8px;
@@ -253,32 +244,32 @@ METABASE_CSS = """
 st.markdown(METABASE_CSS, unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════════
-# PLOTLY THEME — Consistent Metabase look
+# ALTAIR THEME — Consistent Metabase look (Vega-Lite, ~10x lighter than Plotly)
 # ══════════════════════════════════════════════════════════════
 METABASE_COLORS = ['#4C9AFF', '#7F56D9', '#EF6C6C', '#F0A756', '#51CF66',
                    '#36B5A0', '#A78BFA', '#FB923C', '#64748B', '#EC4899']
 
-PLOTLY_LAYOUT = dict(
-    font=dict(family="Inter, -apple-system, sans-serif", color="#2E353B", size=12),
-    paper_bgcolor="rgba(0,0,0,0)",
-    plot_bgcolor="rgba(0,0,0,0)",
-    margin=dict(t=42, l=16, r=16, b=16),
-    title=dict(font=dict(size=14, color="#2E353B"), x=0, xanchor='left', pad=dict(l=4)),
-    legend=dict(font=dict(size=11), bgcolor="rgba(0,0,0,0)"),
-    xaxis=dict(gridcolor="#F0F2F5", zerolinecolor="#E8ECF0"),
-    yaxis=dict(gridcolor="#F0F2F5", zerolinecolor="#E8ECF0"),
-    colorway=METABASE_COLORS,
-    hoverlabel=dict(bgcolor="#2E353B", font_size=12, font_color="white"),
-)
+
+def _metabase_theme():
+    return {
+        'config': {
+            'font': 'Inter, -apple-system, sans-serif',
+            'title': {'fontSize': 14, 'color': '#2E353B', 'anchor': 'start',
+                      'fontWeight': 600, 'offset': 12},
+            'axis': {'gridColor': '#F0F2F5', 'domainColor': '#E8ECF0',
+                     'labelColor': '#696E7A', 'titleColor': '#2E353B',
+                     'labelFontSize': 11, 'titleFontSize': 12},
+            'legend': {'labelColor': '#696E7A', 'labelFontSize': 11},
+            'view': {'strokeWidth': 0},
+            'background': 'transparent',
+            'range': {'category': METABASE_COLORS},
+            'arc': {'innerRadius': 60},
+        }
+    }
 
 
-PLOTLY_CONFIG = {"displayModeBar": False, "scrollZoom": False}
-
-
-def apply_metabase_style(fig, height=380):
-    """Apply Metabase visual style to any Plotly figure."""
-    fig.update_layout(**PLOTLY_LAYOUT, height=height)
-    return fig
+alt.themes.register('metabase', _metabase_theme)
+alt.themes.enable('metabase')
 
 
 # ══════════════════════════════════════════════════════════════
@@ -615,15 +606,16 @@ def _timeline_data(pub_dates):
 
 
 # ══════════════════════════════════════════════════════════════
-# TABS
+# NAVIGATION — conditional rendering (only active section builds charts)
 # ══════════════════════════════════════════════════════════════
-tab1, tab2, tab3, tab4 = st.tabs(["Dashboard", "Explorador", "Alertas", "Análisis"])
+NAV_OPTIONS = ["Dashboard", "Explorador", "Alertas", "Análisis"]
+active_tab = st.radio("nav", NAV_OPTIONS, horizontal=True, label_visibility="collapsed")
 
 
 # ══════════════════════════════════════════════════════════════
-# TAB 1: DASHBOARD
+# SECTION: DASHBOARD
 # ══════════════════════════════════════════════════════════════
-with tab1:
+if active_tab == "Dashboard":
 
     # --- KPI row ---
     kpi1, kpi2, kpi3, kpi4, kpi5, kpi6 = st.columns(6)
@@ -661,39 +653,28 @@ with tab1:
         _cat_vc = _value_counts(df_filtered.loc[df_filtered["_ne_categoria"], "categoria"])
         cat_data = _cat_vc.rename(columns={'value': 'Categoría', 'count': 'Artículos'})
         if not cat_data.empty:
-            cat_data = cat_data.sort_values('Artículos', ascending=True)
-            fig_cat = px.bar(
-                cat_data, x='Artículos', y='Categoría', orientation='h',
-                title='Artículos por categoría',
-                text='Artículos'
+            bars = alt.Chart(cat_data).mark_bar(color='#4C9AFF').encode(
+                x=alt.X('Artículos:Q', axis=alt.Axis(title='')),
+                y=alt.Y('Categoría:N', sort='-x', axis=alt.Axis(title='')),
+                tooltip=['Categoría:N', 'Artículos:Q']
             )
-            fig_cat.update_traces(
-                marker_color='#4C9AFF',
-                textposition='outside',
-                textfont=dict(size=11)
-            )
-            fig_cat.update_layout(xaxis_title='', yaxis_title='')
-            apply_metabase_style(fig_cat, height=max(320, len(cat_data) * 30 + 60))
-            st.plotly_chart(fig_cat, use_container_width=True, config=PLOTLY_CONFIG)
+            text = bars.mark_text(align='left', dx=3, fontSize=11).encode(text='Artículos:Q')
+            st.altair_chart(
+                (bars + text).properties(
+                    title='Artículos por categoría',
+                    height=max(320, len(cat_data) * 30 + 60)
+                ), use_container_width=True)
 
     with col_chart2:
         _type_vc = _value_counts(df_filtered.loc[df_filtered["_ne_tipo_contenido"], "tipo_contenido"])
         type_data = _type_vc.rename(columns={'value': 'Tipo', 'count': 'Artículos'})
         if not type_data.empty:
-            fig_type = px.pie(
-                type_data, names='Tipo', values='Artículos',
-                title='Distribución por tipo de contenido',
-                hole=0.5,
-                color_discrete_sequence=METABASE_COLORS
-            )
-            fig_type.update_traces(
-                textposition='outside',
-                textinfo='label+percent',
-                textfont=dict(size=11),
-                pull=[0.02] * len(type_data)
-            )
-            apply_metabase_style(fig_type, height=400)
-            st.plotly_chart(fig_type, use_container_width=True, config=PLOTLY_CONFIG)
+            donut = alt.Chart(type_data).mark_arc(innerRadius=60).encode(
+                theta=alt.Theta('Artículos:Q'),
+                color=alt.Color('Tipo:N', scale=alt.Scale(range=METABASE_COLORS)),
+                tooltip=['Tipo:N', 'Artículos:Q']
+            ).properties(title='Distribución por tipo de contenido', height=400)
+            st.altair_chart(donut, use_container_width=True)
 
     # --- Charts row 2 ---
     col_chart3, col_chart4 = st.columns(2)
@@ -702,49 +683,41 @@ with tab1:
         _vig_vc = _value_counts(df_filtered.loc[df_filtered["_ne_vigencia"], "vigencia"])
         vig_data = _vig_vc.rename(columns={'value': 'Vigencia', 'count': 'Artículos'})
         if not vig_data.empty:
-            color_map_vig = {
-                VIGENCIA_EVERGREEN: '#51CF66',
-                VIGENCIA_ACTUALIZABLE: '#F0A756',
-                VIGENCIA_CADUCO: '#EF6C6C',
-            }
-            fig_vig = px.bar(
-                vig_data, x='Vigencia', y='Artículos',
-                title='Distribución por vigencia',
-                color='Vigencia',
-                color_discrete_map=color_map_vig,
-                text='Artículos'
+            vig_domain = [VIGENCIA_EVERGREEN, VIGENCIA_ACTUALIZABLE, VIGENCIA_CADUCO]
+            vig_range = ['#51CF66', '#F0A756', '#EF6C6C']
+            bars = alt.Chart(vig_data).mark_bar().encode(
+                x=alt.X('Vigencia:N', axis=alt.Axis(title='')),
+                y=alt.Y('Artículos:Q', axis=alt.Axis(title='')),
+                color=alt.Color('Vigencia:N',
+                                scale=alt.Scale(domain=vig_domain, range=vig_range),
+                                legend=None),
+                tooltip=['Vigencia:N', 'Artículos:Q']
             )
-            fig_vig.update_traces(textposition='outside', textfont=dict(size=12))
-            fig_vig.update_layout(showlegend=False, xaxis_title='', yaxis_title='')
-            apply_metabase_style(fig_vig, height=340)
-            st.plotly_chart(fig_vig, use_container_width=True, config=PLOTLY_CONFIG)
+            text = bars.mark_text(dy=-10, fontSize=12).encode(text='Artículos:Q')
+            st.altair_chart(
+                (bars + text).properties(title='Distribución por vigencia', height=340),
+                use_container_width=True)
 
     with col_chart4:
         _st_vc = _value_counts(df_filtered['status_code'])
         status_data = _st_vc.rename(columns={'value': 'Status', 'count': 'URLs'})
         status_data['Status'] = status_data['Status'].astype(str)
         if not status_data.empty:
-            status_color_map = {'200': '#51CF66', '301': '#F0A756', '404': '#EF6C6C'}
-            colors_list = [status_color_map.get(s, '#64748B') for s in status_data['Status']]
-            fig_status = px.pie(
-                status_data, names='Status', values='URLs',
-                title='Códigos de estado HTTP',
-                hole=0.5,
-            )
-            fig_status.update_traces(
-                marker=dict(colors=colors_list),
-                textposition='outside',
-                textinfo='label+value+percent',
-                textfont=dict(size=11)
-            )
-            apply_metabase_style(fig_status, height=340)
-            st.plotly_chart(fig_status, use_container_width=True, config=PLOTLY_CONFIG)
+            s_domain = status_data['Status'].tolist()
+            s_range = [{'200': '#51CF66', '301': '#F0A756', '404': '#EF6C6C'}.get(s, '#64748B')
+                       for s in s_domain]
+            donut = alt.Chart(status_data).mark_arc(innerRadius=60).encode(
+                theta=alt.Theta('URLs:Q'),
+                color=alt.Color('Status:N', scale=alt.Scale(domain=s_domain, range=s_range)),
+                tooltip=['Status:N', 'URLs:Q']
+            ).properties(title='Códigos de estado HTTP', height=340)
+            st.altair_chart(donut, use_container_width=True)
 
 
 # ══════════════════════════════════════════════════════════════
-# TAB 2: EXPLORER
+# SECTION: EXPLORER
 # ══════════════════════════════════════════════════════════════
-with tab2:
+elif active_tab == "Explorador":
 
     st.markdown(
         f'<div class="section-header">Explorador de URLs — {n_filtered} resultados</div>',
@@ -791,8 +764,8 @@ with tab2:
 
 
 # ══════════════════════════════════════════════════════════════
-# TAB 3: ALERTS — wrapped in @st.fragment so the internal
-#         multiselect filter does NOT trigger a full page rerun
+# SECTION: ALERTS — wrapped in @st.fragment so the internal
+#          multiselect filter does NOT trigger a full page rerun
 # ══════════════════════════════════════════════════════════════
 @st.fragment
 def _render_alerts_tab(df_alerts_data):
@@ -875,53 +848,41 @@ def _render_alerts_tab(df_alerts_data):
         _abt_vc = _value_counts(df_alerts_active['alert_type'])
         alert_breakdown = _abt_vc.rename(columns={'value': 'Tipo', 'count': 'Cantidad'})
         if not alert_breakdown.empty:
-            fig_alerts = px.bar(
-                alert_breakdown.sort_values('Cantidad', ascending=True),
-                x='Cantidad', y='Tipo', orientation='h',
-                title='Alertas por tipo',
-                text='Cantidad',
-                color_discrete_sequence=['#EF6C6C']
+            bars = alt.Chart(alert_breakdown).mark_bar(color='#EF6C6C').encode(
+                x=alt.X('Cantidad:Q', axis=alt.Axis(title='')),
+                y=alt.Y('Tipo:N', sort='-x', axis=alt.Axis(title='')),
+                tooltip=['Tipo:N', 'Cantidad:Q']
             )
-            fig_alerts.update_traces(textposition='outside', textfont=dict(size=11))
-            fig_alerts.update_layout(xaxis_title='', yaxis_title='')
-            apply_metabase_style(
-                fig_alerts,
-                height=max(280, len(alert_breakdown) * 32 + 60)
-            )
-            st.plotly_chart(fig_alerts, use_container_width=True, config=PLOTLY_CONFIG)
+            text = bars.mark_text(align='left', dx=3, fontSize=11).encode(text='Cantidad:Q')
+            st.altair_chart(
+                (bars + text).properties(
+                    title='Alertas por tipo',
+                    height=max(280, len(alert_breakdown) * 32 + 60)
+                ), use_container_width=True)
 
     with col_al2:
         if 'severity' in df_alerts_active.columns:
             _sev_vc = _value_counts(df_alerts_active['severity'])
             sev_data = _sev_vc.rename(columns={'value': 'Severidad', 'count': 'Cantidad'})
-            sev_color_map = {
-                'ALTA': '#EF6C6C', 'MEDIA': '#F0A756', 'BAJA': '#4C9AFF'
-            }
-            sev_colors = [
-                sev_color_map.get(s, '#64748B') for s in sev_data['Severidad']
-            ]
-            fig_sev = px.pie(
-                sev_data, names='Severidad', values='Cantidad',
-                title='Alertas por severidad',
-                hole=0.5,
-            )
-            fig_sev.update_traces(
-                marker=dict(colors=sev_colors),
-                textinfo='label+value+percent',
-                textposition='outside'
-            )
-            apply_metabase_style(fig_sev, height=320)
-            st.plotly_chart(fig_sev, use_container_width=True, config=PLOTLY_CONFIG)
+            sev_domain = ['ALTA', 'MEDIA', 'BAJA']
+            sev_range = ['#EF6C6C', '#F0A756', '#4C9AFF']
+            donut = alt.Chart(sev_data).mark_arc(innerRadius=60).encode(
+                theta=alt.Theta('Cantidad:Q'),
+                color=alt.Color('Severidad:N',
+                                scale=alt.Scale(domain=sev_domain, range=sev_range)),
+                tooltip=['Severidad:N', 'Cantidad:Q']
+            ).properties(title='Alertas por severidad', height=320)
+            st.altair_chart(donut, use_container_width=True)
 
 
-with tab3:
+if active_tab == "Alertas":
     _render_alerts_tab(df_alerts)
 
 
 # ══════════════════════════════════════════════════════════════
-# TAB 4: ANALYSIS
+# SECTION: ANALYSIS
 # ══════════════════════════════════════════════════════════════
-with tab4:
+elif active_tab == "Análisis":
 
     st.markdown('<div class="section-header">Análisis de contenido</div>', unsafe_allow_html=True)
 
@@ -932,43 +893,43 @@ with tab4:
         _gap_vc = _value_counts(df_filtered.loc[df_filtered["_ne_categoria"], "categoria"])
         cat_counts = _gap_vc.rename(columns={'value': 'Categoría', 'count': 'Artículos'})
         if not cat_counts.empty:
-            cat_counts_sorted = cat_counts.sort_values('Artículos', ascending=True)
-            fig_gap = px.bar(
-                cat_counts_sorted,
-                x='Artículos', y='Categoría', orientation='h',
-                title='Content gap — categorías con menos contenido',
-                text='Artículos',
-                color='Artículos',
-                color_continuous_scale=['#EF6C6C', '#F0A756', '#51CF66']
+            bars = alt.Chart(cat_counts).mark_bar().encode(
+                x=alt.X('Artículos:Q', axis=alt.Axis(title='')),
+                y=alt.Y('Categoría:N', sort=alt.EncodingSortField('Artículos', order='ascending'),
+                         axis=alt.Axis(title='')),
+                color=alt.Color('Artículos:Q',
+                                scale=alt.Scale(range=['#EF6C6C', '#F0A756', '#51CF66']),
+                                legend=None),
+                tooltip=['Categoría:N', 'Artículos:Q']
             )
-            fig_gap.update_traces(textposition='outside', textfont=dict(size=11))
-            fig_gap.update_layout(xaxis_title='', yaxis_title='', coloraxis_showscale=False)
-            apply_metabase_style(fig_gap, height=max(340, len(cat_counts) * 30 + 60))
-            st.plotly_chart(fig_gap, use_container_width=True, config=PLOTLY_CONFIG)
+            text = bars.mark_text(align='left', dx=3, fontSize=11).encode(text='Artículos:Q')
+            st.altair_chart(
+                (bars + text).properties(
+                    title='Content gap — categorías con menos contenido',
+                    height=max(340, len(cat_counts) * 30 + 60)
+                ), use_container_width=True)
 
     with col_a2:
         if 'word_count' in df_filtered.columns:
             df_words = df_filtered[df_filtered['word_count'] > 0]
             if not df_words.empty:
-                fig_words = px.histogram(
-                    df_words, x='word_count', nbins=25,
-                    title='Distribución de extensión (palabras por artículo)',
-                    color_discrete_sequence=['#4C9AFF']
-                )
-                fig_words.update_layout(
-                    xaxis_title='Palabras',
-                    yaxis_title='Nº artículos',
-                    bargap=0.08
-                )
                 median_wc = int(df_words['word_count'].median())
-                fig_words.add_vline(
-                    x=median_wc, line_dash="dash", line_color="#7F56D9",
-                    annotation_text=f"Mediana: {median_wc}",
-                    annotation_position="top right",
-                    annotation_font=dict(size=11, color="#7F56D9")
+                hist = alt.Chart(df_words).mark_bar(color='#4C9AFF').encode(
+                    alt.X('word_count:Q', bin=alt.Bin(maxbins=25), title='Palabras'),
+                    alt.Y('count()', title='Nº artículos'),
+                    tooltip=[alt.Tooltip('word_count:Q', bin=alt.Bin(maxbins=25), title='Rango'),
+                             alt.Tooltip('count()', title='Artículos')]
                 )
-                apply_metabase_style(fig_words, height=400)
-                st.plotly_chart(fig_words, use_container_width=True, config=PLOTLY_CONFIG)
+                rule = alt.Chart(pd.DataFrame({'x': [median_wc]})).mark_rule(
+                    color='#7F56D9', strokeDash=[5, 5], strokeWidth=2
+                ).encode(x='x:Q')
+                label = alt.Chart(pd.DataFrame({'x': [median_wc], 'text': [f'Mediana: {median_wc}']})).mark_text(
+                    align='left', dx=5, dy=-10, fontSize=11, color='#7F56D9'
+                ).encode(x='x:Q', text='text:N')
+                st.altair_chart(
+                    (hist + rule + label).properties(
+                        title='Distribución de extensión (palabras por artículo)', height=400
+                    ), use_container_width=True)
 
     st.markdown("")
 
@@ -980,29 +941,28 @@ with tab4:
             df_cat_valid = df_filtered[df_filtered["_ne_categoria"]]
             if not df_cat_valid.empty:
                 carousel_by_cat = _carousel_penetration(df_cat_valid)
-
-                fig_carousel = px.bar(
-                    carousel_by_cat, x='pct_carrusel', y='categoria', orientation='h',
-                    title='Penetración de carrusel de producto por categoría',
-                    text=carousel_by_cat['pct_carrusel'].apply(lambda x: f"{x:.0f}%"),
-                    color='pct_carrusel',
-                    color_continuous_scale=['#E8ECF0', '#51CF66']
+                carousel_by_cat['label'] = carousel_by_cat['pct_carrusel'].apply(lambda x: f"{x:.0f}%")
+                bars = alt.Chart(carousel_by_cat).mark_bar().encode(
+                    x=alt.X('pct_carrusel:Q', axis=alt.Axis(title='%')),
+                    y=alt.Y('categoria:N',
+                             sort=alt.EncodingSortField('pct_carrusel', order='ascending'),
+                             axis=alt.Axis(title='')),
+                    color=alt.Color('pct_carrusel:Q',
+                                    scale=alt.Scale(range=['#E8ECF0', '#51CF66']),
+                                    legend=None),
+                    tooltip=['categoria:N', 'pct_carrusel:Q']
                 )
-                fig_carousel.update_traces(textposition='outside', textfont=dict(size=11))
-                fig_carousel.update_layout(
-                    xaxis_title='%', yaxis_title='',
-                    coloraxis_showscale=False
-                )
-                apply_metabase_style(
-                    fig_carousel,
-                    height=max(340, len(carousel_by_cat) * 30 + 60)
-                )
-                st.plotly_chart(fig_carousel, use_container_width=True, config=PLOTLY_CONFIG)
+                text = bars.mark_text(align='left', dx=3, fontSize=11).encode(text='label:N')
+                st.altair_chart(
+                    (bars + text).properties(
+                        title='Penetración de carrusel de producto por categoría',
+                        height=max(340, len(carousel_by_cat) * 30 + 60)
+                    ), use_container_width=True)
 
     with col_a4:
         df_old = df_filtered[
             df_filtered['vigencia'].isin([VIGENCIA_CADUCO, VIGENCIA_ACTUALIZABLE])
-        ].copy()
+        ]
 
         if not df_old.empty and 'lastmod_parsed' in df_old.columns:
             df_old = df_old.dropna(subset=['lastmod_parsed'])
@@ -1047,14 +1007,28 @@ with tab4:
     if not df_heat.empty:
         cross = _crosstab(df_heat['categoria'], df_heat['tipo_contenido'])
         if not cross.empty and cross.shape[0] > 1 and cross.shape[1] > 1:
-            fig_heat = px.imshow(
-                cross, text_auto=True, aspect='auto',
-                title='Mapa de contenido — Categoría × Tipo',
-                color_continuous_scale=['#F5F7FA', '#4C9AFF', '#7F56D9']
+            cross_melted = cross.reset_index().melt(
+                id_vars='categoria', var_name='tipo_contenido', value_name='count')
+            mean_val = cross.values.mean()
+            base = alt.Chart(cross_melted).mark_rect().encode(
+                x=alt.X('tipo_contenido:N', title=''),
+                y=alt.Y('categoria:N', title=''),
+                color=alt.Color('count:Q',
+                                scale=alt.Scale(range=['#F5F7FA', '#4C9AFF', '#7F56D9']),
+                                legend=None),
+                tooltip=['categoria:N', 'tipo_contenido:N', 'count:Q']
             )
-            fig_heat.update_layout(xaxis_title='', yaxis_title='')
-            apply_metabase_style(fig_heat, height=max(400, cross.shape[0] * 32 + 80))
-            st.plotly_chart(fig_heat, use_container_width=True, config=PLOTLY_CONFIG)
+            text = base.mark_text(fontSize=11).encode(
+                text='count:Q',
+                color=alt.condition(
+                    alt.datum.count > mean_val,
+                    alt.value('white'), alt.value('#2E353B'))
+            )
+            st.altair_chart(
+                (base + text).properties(
+                    title='Mapa de contenido — Categoría × Tipo',
+                    height=max(400, cross.shape[0] * 32 + 80)
+                ), use_container_width=True)
 
     st.markdown("")
 
@@ -1062,16 +1036,9 @@ with tab4:
     if 'pub_date_parsed' in df_filtered.columns:
         timeline_data = _timeline_data(df_filtered['pub_date_parsed'])
         if not timeline_data.empty:
-            fig_timeline = px.bar(
-                timeline_data, x='year_month', y='Artículos',
-                title='Publicaciones por mes',
-                color_discrete_sequence=['#4C9AFF']
-            )
-            fig_timeline.update_layout(
-                xaxis_title='',
-                yaxis_title='Artículos publicados',
-                bargap=0.15,
-                xaxis=dict(tickangle=-45, dtick=3)
-            )
-            apply_metabase_style(fig_timeline, height=350)
-            st.plotly_chart(fig_timeline, use_container_width=True, config=PLOTLY_CONFIG)
+            chart = alt.Chart(timeline_data).mark_bar(color='#4C9AFF').encode(
+                x=alt.X('year_month:N', title='', axis=alt.Axis(labelAngle=-45)),
+                y=alt.Y('Artículos:Q', title='Artículos publicados'),
+                tooltip=['year_month:N', 'Artículos:Q']
+            ).properties(title='Publicaciones por mes', height=350)
+            st.altair_chart(chart, use_container_width=True)
