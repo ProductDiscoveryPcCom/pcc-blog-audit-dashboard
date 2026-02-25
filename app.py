@@ -75,9 +75,11 @@ st.set_page_config(
 # METABASE-STYLE CSS
 # ══════════════════════════════════════════════════════════════
 METABASE_CSS = """
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <style>
     /* === GLOBAL === */
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap&subset=latin');
 
     html, body, [class*="css"] {
         font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
@@ -270,6 +272,9 @@ PLOTLY_LAYOUT = dict(
 )
 
 
+PLOTLY_CONFIG = {"displayModeBar": False, "scrollZoom": False}
+
+
 def apply_metabase_style(fig, height=380):
     """Apply Metabase visual style to any Plotly figure."""
     fig.update_layout(**PLOTLY_LAYOUT, height=height)
@@ -410,7 +415,7 @@ def load_data():
 
         for col in BOOL_COLUMNS:
             if col in df.columns:
-                df[col] = df[col].apply(parse_bool)
+                df[col] = df[col].astype(str).str.strip().str.upper().isin(TRUTHY_VALUES)
 
         if "year_in_title" in df.columns:
             df["year_in_title"] = pd.to_numeric(df["year_in_title"], errors="coerce")
@@ -495,36 +500,36 @@ with st.sidebar:
 
     st.markdown("---")
 
-    # Apply filters
-    df_filtered = df.copy()
+    # Apply filters — build a single boolean mask instead of copying df repeatedly
+    mask = pd.Series(True, index=df.index)
     if selected_cats:
-        df_filtered = df_filtered[df_filtered['categoria'].isin(selected_cats)]
+        mask &= df['categoria'].isin(selected_cats)
     if selected_subcats:
-        df_filtered = df_filtered[df_filtered['subcategoria'].isin(selected_subcats)]
+        mask &= df['subcategoria'].isin(selected_subcats)
     if selected_types:
-        df_filtered = df_filtered[df_filtered['tipo_contenido'].isin(selected_types)]
+        mask &= df['tipo_contenido'].isin(selected_types)
     if selected_vigencia:
-        df_filtered = df_filtered[df_filtered['vigencia'].isin(selected_vigencia)]
+        mask &= df['vigencia'].isin(selected_vigencia)
     if filter_carousel == "Con carrusel":
-        df_filtered = df_filtered[df_filtered['has_product_carousel'] ]
+        mask &= df['has_product_carousel']
     elif filter_carousel == "Sin carrusel":
-        df_filtered = df_filtered[df_filtered['has_product_carousel'] == False]
+        mask &= ~df['has_product_carousel']
     if filter_alerts == "Con alertas":
-        df_filtered = df_filtered[df_filtered['has_alerts'] ]
+        mask &= df['has_alerts']
     elif filter_alerts == "Sin alertas":
-        df_filtered = df_filtered[df_filtered['has_alerts'] == False]
+        mask &= ~df['has_alerts']
     if filter_status != "Todos":
-        df_filtered = df_filtered[df_filtered['status_code'] == int(filter_status)]
+        mask &= df['status_code'] == int(filter_status)
     if search_text:
         search_lower = search_text.lower()
-        mask = (
-            df_filtered['url'].astype(str).str.lower().str.contains(search_lower, na=False) |
-            df_filtered.get('meta_title', pd.Series(dtype=str)).astype(str).str.lower().str.contains(
+        mask &= (
+            df['url'].astype(str).str.lower().str.contains(search_lower, na=False) |
+            df.get('meta_title', pd.Series(dtype=str)).astype(str).str.lower().str.contains(
                 search_lower, na=False) |
-            df_filtered.get('sitemap_title', pd.Series(dtype=str)).astype(str).str.lower().str.contains(
+            df.get('sitemap_title', pd.Series(dtype=str)).astype(str).str.lower().str.contains(
                 search_lower, na=False)
         )
-        df_filtered = df_filtered[mask]
+    df_filtered = df.loc[mask]
 
     n_total = len(df)
     n_filtered = len(df_filtered)
@@ -545,6 +550,47 @@ with st.sidebar:
             st.session_state["current_user"] = None
             logger.info("User logged out")
             st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════
+# CACHED CHART HELPERS — avoid recomputing on every rerun
+# ══════════════════════════════════════════════════════════════
+@st.cache_data
+def _value_counts(series):
+    """Cached value_counts returning a DataFrame with columns [value, count]."""
+    vc = series.value_counts().reset_index()
+    vc.columns = ['value', 'count']
+    return vc
+
+
+@st.cache_data
+def _crosstab(idx_series, col_series):
+    """Cached crosstab."""
+    return pd.crosstab(idx_series, col_series)
+
+
+@st.cache_data
+def _carousel_penetration(categories, carousel_flags, urls):
+    """Cached carousel penetration aggregation."""
+    tmp = pd.DataFrame({'categoria': categories, 'has_product_carousel': carousel_flags, 'url': urls})
+    agg = tmp.groupby('categoria').agg(
+        total=('url', 'count'),
+        con_carrusel=('has_product_carousel', 'sum')
+    ).reset_index()
+    agg['pct_carrusel'] = (agg['con_carrusel'] / agg['total'] * 100).round(1)
+    return agg.sort_values('pct_carrusel', ascending=True)
+
+
+@st.cache_data
+def _timeline_data(pub_dates):
+    """Cached publication timeline aggregation."""
+    s = pub_dates.dropna()
+    if s.empty:
+        return pd.DataFrame()
+    ym = s.dt.to_period('M').astype(str)
+    tl = ym.value_counts().reset_index()
+    tl.columns = ['year_month', 'Artículos']
+    return tl.sort_values('year_month')
 
 
 # ══════════════════════════════════════════════════════════════
@@ -591,10 +637,8 @@ with tab1:
     col_chart1, col_chart2 = st.columns(2)
 
     with col_chart1:
-        cat_data = df_filtered[
-            non_empty_mask(df_filtered["categoria"])
-        ]["categoria"].value_counts().reset_index()
-        cat_data.columns = ['Categoría', 'Artículos']
+        _cat_vc = _value_counts(df_filtered[non_empty_mask(df_filtered["categoria"])]["categoria"])
+        cat_data = _cat_vc.rename(columns={'value': 'Categoría', 'count': 'Artículos'})
         if not cat_data.empty:
             cat_data = cat_data.sort_values('Artículos', ascending=True)
             fig_cat = px.bar(
@@ -609,13 +653,11 @@ with tab1:
             )
             fig_cat.update_layout(xaxis_title='', yaxis_title='')
             apply_metabase_style(fig_cat, height=max(320, len(cat_data) * 30 + 60))
-            st.plotly_chart(fig_cat, use_container_width=True)
+            st.plotly_chart(fig_cat, use_container_width=True, config=PLOTLY_CONFIG)
 
     with col_chart2:
-        type_data = df_filtered[
-            non_empty_mask(df_filtered["tipo_contenido"])
-        ]["tipo_contenido"].value_counts().reset_index()
-        type_data.columns = ['Tipo', 'Artículos']
+        _type_vc = _value_counts(df_filtered[non_empty_mask(df_filtered["tipo_contenido"])]["tipo_contenido"])
+        type_data = _type_vc.rename(columns={'value': 'Tipo', 'count': 'Artículos'})
         if not type_data.empty:
             fig_type = px.pie(
                 type_data, names='Tipo', values='Artículos',
@@ -630,16 +672,14 @@ with tab1:
                 pull=[0.02] * len(type_data)
             )
             apply_metabase_style(fig_type, height=400)
-            st.plotly_chart(fig_type, use_container_width=True)
+            st.plotly_chart(fig_type, use_container_width=True, config=PLOTLY_CONFIG)
 
     # --- Charts row 2 ---
     col_chart3, col_chart4 = st.columns(2)
 
     with col_chart3:
-        vig_data = df_filtered[
-            non_empty_mask(df_filtered["vigencia"])
-        ]["vigencia"].value_counts().reset_index()
-        vig_data.columns = ['Vigencia', 'Artículos']
+        _vig_vc = _value_counts(df_filtered[non_empty_mask(df_filtered["vigencia"])]["vigencia"])
+        vig_data = _vig_vc.rename(columns={'value': 'Vigencia', 'count': 'Artículos'})
         if not vig_data.empty:
             color_map_vig = {
                 VIGENCIA_EVERGREEN: '#51CF66',
@@ -656,11 +696,11 @@ with tab1:
             fig_vig.update_traces(textposition='outside', textfont=dict(size=12))
             fig_vig.update_layout(showlegend=False, xaxis_title='', yaxis_title='')
             apply_metabase_style(fig_vig, height=340)
-            st.plotly_chart(fig_vig, use_container_width=True)
+            st.plotly_chart(fig_vig, use_container_width=True, config=PLOTLY_CONFIG)
 
     with col_chart4:
-        status_data = df_filtered['status_code'].value_counts().reset_index()
-        status_data.columns = ['Status', 'URLs']
+        _st_vc = _value_counts(df_filtered['status_code'])
+        status_data = _st_vc.rename(columns={'value': 'Status', 'count': 'URLs'})
         status_data['Status'] = status_data['Status'].astype(str)
         if not status_data.empty:
             status_color_map = {'200': '#51CF66', '301': '#F0A756', '404': '#EF6C6C'}
@@ -677,7 +717,7 @@ with tab1:
                 textfont=dict(size=11)
             )
             apply_metabase_style(fig_status, height=340)
-            st.plotly_chart(fig_status, use_container_width=True)
+            st.plotly_chart(fig_status, use_container_width=True, config=PLOTLY_CONFIG)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -719,19 +759,25 @@ with tab2:
     )
 
     # Export buttons
+    @st.cache_data
+    def _to_csv(data):
+        return data.to_csv(index=False).encode('utf-8')
+
+    @st.cache_data
+    def _to_excel(data):
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine='openpyxl') as writer:
+            data.to_excel(writer, index=False, sheet_name='URLs')
+        return buf.getvalue()
+
     col_exp1, col_exp2, _ = st.columns([1, 1, 4])
     with col_exp1:
-        csv_data = df_filtered[available_cols].to_csv(index=False).encode('utf-8')
-        st.download_button("Exportar CSV", csv_data, "blog_audit_export.csv", "text/csv")
+        st.download_button("Exportar CSV", _to_csv(df_filtered[available_cols]),
+                           "blog_audit_export.csv", "text/csv")
     with col_exp2:
-        buffer = io.BytesIO()
-        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-            df_filtered[available_cols].to_excel(writer, index=False, sheet_name='URLs')
-        st.download_button(
-            "Exportar Excel", buffer.getvalue(),
-            "blog_audit_export.xlsx",
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+        st.download_button("Exportar Excel", _to_excel(df_filtered[available_cols]),
+                           "blog_audit_export.xlsx",
+                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -744,8 +790,8 @@ with tab3:
     if df_alerts.empty:
         st.info("No hay alertas registradas todavía. Se generarán con el workflow de alertas en n8n.")
     else:
-        # Resolve boolean
-        df_alerts['_resolved'] = df_alerts['resolved'].apply(parse_bool)
+        # Resolve boolean (vectorized)
+        df_alerts['_resolved'] = df_alerts['resolved'].astype(str).str.strip().str.upper().isin(TRUTHY_VALUES)
         df_alerts_active = df_alerts[~df_alerts['_resolved']].copy()
 
         # KPIs
@@ -812,8 +858,8 @@ with tab3:
 
             with col_al1:
                 # Alert type breakdown
-                alert_breakdown = df_alerts_active['alert_type'].value_counts().reset_index()
-                alert_breakdown.columns = ['Tipo', 'Cantidad']
+                _abt_vc = _value_counts(df_alerts_active['alert_type'])
+                alert_breakdown = _abt_vc.rename(columns={'value': 'Tipo', 'count': 'Cantidad'})
                 if not alert_breakdown.empty:
                     fig_alerts = px.bar(
                         alert_breakdown.sort_values('Cantidad', ascending=True),
@@ -828,13 +874,13 @@ with tab3:
                         fig_alerts,
                         height=max(280, len(alert_breakdown) * 32 + 60)
                     )
-                    st.plotly_chart(fig_alerts, use_container_width=True)
+                    st.plotly_chart(fig_alerts, use_container_width=True, config=PLOTLY_CONFIG)
 
             with col_al2:
                 # Severity donut
                 if 'severity' in df_alerts_active.columns:
-                    sev_data = df_alerts_active['severity'].value_counts().reset_index()
-                    sev_data.columns = ['Severidad', 'Cantidad']
+                    _sev_vc = _value_counts(df_alerts_active['severity'])
+                    sev_data = _sev_vc.rename(columns={'value': 'Severidad', 'count': 'Cantidad'})
                     sev_color_map = {
                         'ALTA': '#EF6C6C', 'MEDIA': '#F0A756', 'BAJA': '#4C9AFF'
                     }
@@ -852,7 +898,7 @@ with tab3:
                         textposition='outside'
                     )
                     apply_metabase_style(fig_sev, height=320)
-                    st.plotly_chart(fig_sev, use_container_width=True)
+                    st.plotly_chart(fig_sev, use_container_width=True, config=PLOTLY_CONFIG)
         else:
             st.success("No hay alertas activas. Todo en orden.")
 
@@ -868,10 +914,8 @@ with tab4:
     col_a1, col_a2 = st.columns(2)
 
     with col_a1:
-        cat_counts = df_filtered[
-            non_empty_mask(df_filtered["categoria"])
-        ]["categoria"].value_counts().reset_index()
-        cat_counts.columns = ['Categoría', 'Artículos']
+        _gap_vc = _value_counts(df_filtered[non_empty_mask(df_filtered["categoria"])]["categoria"])
+        cat_counts = _gap_vc.rename(columns={'value': 'Categoría', 'count': 'Artículos'})
         if not cat_counts.empty:
             cat_counts_sorted = cat_counts.sort_values('Artículos', ascending=True)
             fig_gap = px.bar(
@@ -885,7 +929,7 @@ with tab4:
             fig_gap.update_traces(textposition='outside', textfont=dict(size=11))
             fig_gap.update_layout(xaxis_title='', yaxis_title='', coloraxis_showscale=False)
             apply_metabase_style(fig_gap, height=max(340, len(cat_counts) * 30 + 60))
-            st.plotly_chart(fig_gap, use_container_width=True)
+            st.plotly_chart(fig_gap, use_container_width=True, config=PLOTLY_CONFIG)
 
     with col_a2:
         if 'word_count' in df_filtered.columns:
@@ -909,7 +953,7 @@ with tab4:
                     annotation_font=dict(size=11, color="#7F56D9")
                 )
                 apply_metabase_style(fig_words, height=400)
-                st.plotly_chart(fig_words, use_container_width=True)
+                st.plotly_chart(fig_words, use_container_width=True, config=PLOTLY_CONFIG)
 
     st.markdown("")
 
@@ -920,14 +964,9 @@ with tab4:
         if 'has_product_carousel' in df_filtered.columns and 'categoria' in df_filtered.columns:
             df_cat_valid = df_filtered[non_empty_mask(df_filtered["categoria"])]
             if not df_cat_valid.empty:
-                carousel_by_cat = df_cat_valid.groupby('categoria').agg(
-                    total=('url', 'count'),
-                    con_carrusel=('has_product_carousel', 'sum')
-                ).reset_index()
-                carousel_by_cat['pct_carrusel'] = (
-                    carousel_by_cat['con_carrusel'] / carousel_by_cat['total'] * 100
-                ).round(1)
-                carousel_by_cat = carousel_by_cat.sort_values('pct_carrusel', ascending=True)
+                carousel_by_cat = _carousel_penetration(
+                    df_cat_valid['categoria'], df_cat_valid['has_product_carousel'], df_cat_valid['url']
+                )
 
                 fig_carousel = px.bar(
                     carousel_by_cat, x='pct_carrusel', y='categoria', orientation='h',
@@ -945,7 +984,7 @@ with tab4:
                     fig_carousel,
                     height=max(340, len(carousel_by_cat) * 30 + 60)
                 )
-                st.plotly_chart(fig_carousel, use_container_width=True)
+                st.plotly_chart(fig_carousel, use_container_width=True, config=PLOTLY_CONFIG)
 
     with col_a4:
         df_old = df_filtered[
@@ -994,7 +1033,7 @@ with tab4:
         non_empty_mask(df_filtered["tipo_contenido"])
     ]
     if not df_heat.empty:
-        cross = pd.crosstab(df_heat['categoria'], df_heat['tipo_contenido'])
+        cross = _crosstab(df_heat['categoria'], df_heat['tipo_contenido'])
         if not cross.empty and cross.shape[0] > 1 and cross.shape[1] > 1:
             fig_heat = px.imshow(
                 cross, text_auto=True, aspect='auto',
@@ -1003,18 +1042,14 @@ with tab4:
             )
             fig_heat.update_layout(xaxis_title='', yaxis_title='')
             apply_metabase_style(fig_heat, height=max(400, cross.shape[0] * 32 + 80))
-            st.plotly_chart(fig_heat, use_container_width=True)
+            st.plotly_chart(fig_heat, use_container_width=True, config=PLOTLY_CONFIG)
 
     st.markdown("")
 
     # --- Row 4: Publication timeline ---
     if 'pub_date_parsed' in df_filtered.columns:
-        df_timeline = df_filtered.dropna(subset=['pub_date_parsed']).copy()
-        if not df_timeline.empty:
-            df_timeline['year_month'] = df_timeline['pub_date_parsed'].dt.to_period('M').astype(str)
-            timeline_data = df_timeline.groupby('year_month').size().reset_index(name='Artículos')
-            timeline_data = timeline_data.sort_values('year_month')
-
+        timeline_data = _timeline_data(df_filtered['pub_date_parsed'])
+        if not timeline_data.empty:
             fig_timeline = px.bar(
                 timeline_data, x='year_month', y='Artículos',
                 title='Publicaciones por mes',
@@ -1027,4 +1062,4 @@ with tab4:
                 xaxis=dict(tickangle=-45, dtick=3)
             )
             apply_metabase_style(fig_timeline, height=350)
-            st.plotly_chart(fig_timeline, use_container_width=True)
+            st.plotly_chart(fig_timeline, use_container_width=True, config=PLOTLY_CONFIG)
