@@ -5,8 +5,61 @@ import plotly.graph_objects as go
 import gspread
 from google.oauth2.service_account import Credentials
 import json
+import hashlib
+import logging
 from datetime import datetime
 import io
+
+# ══════════════════════════════════════════════════════════════
+# LOGGING
+# ══════════════════════════════════════════════════════════════
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
+
+# ══════════════════════════════════════════════════════════════
+# CONSTANTS
+# ══════════════════════════════════════════════════════════════
+SHEET_URLS_MASTER = "URLs_Master"
+SHEET_ALERTAS = "Alertas"
+
+VIGENCIA_EVERGREEN = "evergreen"
+VIGENCIA_ACTUALIZABLE = "evergreen_actualizable"
+VIGENCIA_CADUCO = "caduco"
+
+SEVERITY_ALTA = "ALTA"
+SEVERITY_MEDIA = "MEDIA"
+SEVERITY_BAJA = "BAJA"
+SEVERITY_ORDER = {SEVERITY_ALTA: 0, SEVERITY_MEDIA: 1, SEVERITY_BAJA: 2}
+
+INT_COLUMNS = ["status_code", "h2_count", "word_count", "product_count"]
+BOOL_COLUMNS = ["has_noindex", "has_product_carousel", "has_alerts"]
+DATE_COLUMNS = ["pub_date", "lastmod"]
+
+REQUIRED_COLUMNS = ["url", "categoria", "status_code"]
+
+TRUTHY_VALUES = frozenset(("TRUE", "VERDADERO", "1", "YES", "SÍ", "SI"))
+
+CACHE_TTL_SECONDS = 300
+MAX_LOGIN_ATTEMPTS = 5
+LOGIN_LOCKOUT_SECONDS = 300
+
+
+# ══════════════════════════════════════════════════════════════
+# UTILITY FUNCTIONS
+# ══════════════════════════════════════════════════════════════
+def parse_bool(value):
+    """Convert various truthy string representations to Python bool."""
+    return str(value).strip().upper() in TRUTHY_VALUES
+
+
+def non_empty_mask(series):
+    """Return a boolean mask filtering out empty/whitespace-only strings."""
+    return series.astype(str).str.strip() != ""
+
+
+def hash_password(password: str) -> str:
+    """Hash a password using SHA-256."""
+    return hashlib.sha256(password.encode()).hexdigest()
 
 # ══════════════════════════════════════════════════════════════
 # PAGE CONFIG
@@ -224,80 +277,159 @@ def apply_metabase_style(fig, height=380):
 
 
 # ══════════════════════════════════════════════════════════════
-# AUTHENTICATION
+# AUTHENTICATION (SHA-256 hashed, multi-user, brute-force protection)
 # ══════════════════════════════════════════════════════════════
-if 'authenticated' not in st.session_state:
-    st.session_state['authenticated'] = False
+if "authenticated" not in st.session_state:
+    st.session_state["authenticated"] = False
+    st.session_state["login_attempts"] = 0
+    st.session_state["lockout_until"] = None
+    st.session_state["current_user"] = None
 
-if not st.session_state['authenticated']:
+
+def _authenticate(username: str, password: str) -> bool:
+    """Validate credentials against hashed passwords in Streamlit secrets."""
+    users = st.secrets.get("users", {})
+    if not users:
+        logger.warning("No users configured in secrets — login disabled")
+        st.error("No hay usuarios configurados. Añade la sección [users] en Secrets.")
+        return False
+    stored_hash = users.get(username)
+    if stored_hash is None:
+        return False
+    return hash_password(password) == stored_hash
+
+
+if not st.session_state["authenticated"]:
+    # Check lockout
+    now = datetime.now()
+    lockout_until = st.session_state.get("lockout_until")
+    is_locked = lockout_until is not None and now < lockout_until
+
     st.markdown('<div class="login-container">', unsafe_allow_html=True)
     st.markdown('<div class="login-title">Blog Audit</div>', unsafe_allow_html=True)
-    st.markdown('<div class="login-subtitle">PcComponentes — Dashboard de contenido</div>', unsafe_allow_html=True)
-    password = st.text_input("Contraseña", type="password", label_visibility="collapsed",
-                             placeholder="Introduce tu contraseña")
-    if st.button("Entrar", use_container_width=True):
-        if password == st.secrets.get("APP_PASSWORD", ""):
-            st.session_state['authenticated'] = True
-            st.rerun()
-        else:
-            st.error("Contraseña incorrecta")
+    st.markdown('<div class="login-subtitle">PcComponentes — Dashboard de contenido</div>',
+                unsafe_allow_html=True)
+
+    if is_locked:
+        remaining = int((lockout_until - now).total_seconds())
+        st.error(f"Demasiados intentos. Espera {remaining}s antes de reintentar.")
+    else:
+        username = st.text_input("Usuario", placeholder="Tu nombre de usuario")
+        password = st.text_input("Contraseña", type="password", label_visibility="visible",
+                                 placeholder="Introduce tu contraseña")
+        if st.button("Entrar", use_container_width=True):
+            if not username or not password:
+                st.warning("Introduce usuario y contraseña")
+            elif _authenticate(username, password):
+                st.session_state["authenticated"] = True
+                st.session_state["current_user"] = username
+                st.session_state["login_attempts"] = 0
+                logger.info("User '%s' logged in successfully", username)
+                st.rerun()
+            else:
+                st.session_state["login_attempts"] += 1
+                attempts = st.session_state["login_attempts"]
+                logger.warning("Failed login attempt #%d for user '%s'", attempts, username)
+                if attempts >= MAX_LOGIN_ATTEMPTS:
+                    from datetime import timedelta
+                    st.session_state["lockout_until"] = now + timedelta(seconds=LOGIN_LOCKOUT_SECONDS)
+                    st.error(f"Demasiados intentos. Bloqueado durante {LOGIN_LOCKOUT_SECONDS // 60} minutos.")
+                else:
+                    remaining = MAX_LOGIN_ATTEMPTS - attempts
+                    st.error(f"Credenciales incorrectas. {remaining} intentos restantes.")
+
     st.markdown('</div>', unsafe_allow_html=True)
     st.stop()
 
 # ══════════════════════════════════════════════════════════════
-# DATA LOADING
+# DATA LOADING (with schema validation and granular error handling)
 # ══════════════════════════════════════════════════════════════
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=CACHE_TTL_SECONDS)
 def load_data():
-    """Load all data from Google Sheets. Cache for 5 minutes."""
-    creds_dict = json.loads(st.secrets["GCP_SERVICE_ACCOUNT"])
-    creds = Credentials.from_service_account_info(
-        creds_dict,
-        scopes=['https://www.googleapis.com/auth/spreadsheets.readonly']
-    )
-    gc = gspread.authorize(creds)
-    sh = gc.open_by_key(st.secrets["SPREADSHEET_ID"])
-
-    # URLs Master
-    ws_master = sh.worksheet('URLs_Master')
-    df = pd.DataFrame(ws_master.get_all_records())
-
-    # Alertas
+    """Load all data from Google Sheets with type coercion and validation."""
+    # --- Authenticate with GCP ---
     try:
-        ws_alerts = sh.worksheet('Alertas')
-        df_alerts = pd.DataFrame(ws_alerts.get_all_records())
+        creds_dict = json.loads(st.secrets["GCP_SERVICE_ACCOUNT"])
+    except KeyError:
+        raise RuntimeError("Falta el secret `GCP_SERVICE_ACCOUNT` en Settings → Secrets.")
+    except json.JSONDecodeError:
+        raise RuntimeError("`GCP_SERVICE_ACCOUNT` no es un JSON válido.")
+
+    try:
+        creds = Credentials.from_service_account_info(
+            creds_dict,
+            scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"],
+        )
+        gc = gspread.authorize(creds)
+    except Exception as exc:
+        raise RuntimeError(f"Error de autenticación con GCP: {exc}")
+
+    # --- Open spreadsheet ---
+    try:
+        spreadsheet_id = st.secrets["SPREADSHEET_ID"]
+    except KeyError:
+        raise RuntimeError("Falta el secret `SPREADSHEET_ID` en Settings → Secrets.")
+
+    try:
+        sh = gc.open_by_key(spreadsheet_id)
+    except gspread.exceptions.SpreadsheetNotFound:
+        raise RuntimeError(f"Spreadsheet con ID '{spreadsheet_id}' no encontrado.")
+    except Exception as exc:
+        raise RuntimeError(f"Error abriendo spreadsheet: {exc}")
+
+    # --- URLs Master ---
+    try:
+        ws_master = sh.worksheet(SHEET_URLS_MASTER)
+        df = pd.DataFrame(ws_master.get_all_records())
+        logger.info("Loaded %d rows from %s", len(df), SHEET_URLS_MASTER)
     except gspread.exceptions.WorksheetNotFound:
+        raise RuntimeError(f"Hoja '{SHEET_URLS_MASTER}' no encontrada en el spreadsheet.")
+
+    # --- Alertas (optional) ---
+    try:
+        ws_alerts = sh.worksheet(SHEET_ALERTAS)
+        df_alerts = pd.DataFrame(ws_alerts.get_all_records())
+        logger.info("Loaded %d rows from %s", len(df_alerts), SHEET_ALERTAS)
+    except gspread.exceptions.WorksheetNotFound:
+        logger.info("Sheet '%s' not found — alerts disabled", SHEET_ALERTAS)
         df_alerts = pd.DataFrame()
 
-    # Clean types
+    # --- Schema validation ---
     if not df.empty:
-        int_cols = ['status_code', 'h2_count', 'word_count', 'product_count']
-        for col in int_cols:
+        missing = [col for col in REQUIRED_COLUMNS if col not in df.columns]
+        if missing:
+            raise RuntimeError(
+                f"Columnas obligatorias ausentes en {SHEET_URLS_MASTER}: {', '.join(missing)}"
+            )
+
+    # --- Type coercion ---
+    if not df.empty:
+        for col in INT_COLUMNS:
             if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
 
-        bool_cols = ['has_noindex', 'has_product_carousel', 'has_alerts']
-        for col in bool_cols:
+        for col in BOOL_COLUMNS:
             if col in df.columns:
-                df[col] = df[col].apply(
-                    lambda x: str(x).strip().upper() in ('TRUE', 'VERDADERO', '1', 'YES')
-                )
+                df[col] = df[col].apply(parse_bool)
 
-        if 'year_in_title' in df.columns:
-            df['year_in_title'] = pd.to_numeric(df['year_in_title'], errors='coerce')
+        if "year_in_title" in df.columns:
+            df["year_in_title"] = pd.to_numeric(df["year_in_title"], errors="coerce")
 
-        # Parse dates for time-based analysis
-        for date_col in ['pub_date', 'lastmod']:
+        for date_col in DATE_COLUMNS:
             if date_col in df.columns:
-                df[f'{date_col}_parsed'] = pd.to_datetime(df[date_col], errors='coerce')
+                df[f"{date_col}_parsed"] = pd.to_datetime(df[date_col], errors="coerce")
 
     return df, df_alerts
 
 
 try:
     df, df_alerts = load_data()
+except RuntimeError as e:
+    st.error(str(e))
+    st.stop()
 except Exception as e:
-    st.error(f"Error conectando con Google Sheets: {e}")
+    logger.exception("Unexpected error loading data")
+    st.error(f"Error inesperado: {e}")
     st.info("Configura `SPREADSHEET_ID` y `GCP_SERVICE_ACCOUNT` en Settings → Secrets")
     st.stop()
 
@@ -318,33 +450,30 @@ with st.sidebar:
     st.markdown("##### Filtros")
 
     # Category
-    all_cats = sorted(
-        df[df['categoria'].astype(str).str.strip() != '']['categoria'].unique().tolist()
-    )
+    all_cats = sorted(df[non_empty_mask(df["categoria"])]["categoria"].unique().tolist())
     selected_cats = st.multiselect("Categoría", all_cats, default=[])
 
     # Subcategory — dependent on selected categories
     if selected_cats:
         all_subcats = sorted(
-            df[(df['categoria'].isin(selected_cats)) &
-               (df['subcategoria'].astype(str).str.strip() != '')
-               ]['subcategoria'].unique().tolist()
+            df[(df["categoria"].isin(selected_cats)) & non_empty_mask(df["subcategoria"])]
+            ["subcategoria"].unique().tolist()
         )
     else:
         all_subcats = sorted(
-            df[df['subcategoria'].astype(str).str.strip() != '']['subcategoria'].unique().tolist()
+            df[non_empty_mask(df["subcategoria"])]["subcategoria"].unique().tolist()
         )
     selected_subcats = st.multiselect("Subcategoría", all_subcats, default=[])
 
     # Content type
     all_types = sorted(
-        df[df['tipo_contenido'].astype(str).str.strip() != '']['tipo_contenido'].unique().tolist()
+        df[non_empty_mask(df["tipo_contenido"])]["tipo_contenido"].unique().tolist()
     )
     selected_types = st.multiselect("Tipo de contenido", all_types, default=[])
 
     # Vigencia
     all_vigencia = sorted(
-        df[df['vigencia'].astype(str).str.strip() != '']['vigencia'].unique().tolist()
+        df[non_empty_mask(df["vigencia"])]["vigencia"].unique().tolist()
     )
     selected_vigencia = st.multiselect("Vigencia", all_vigencia, default=[])
 
@@ -377,11 +506,11 @@ with st.sidebar:
     if selected_vigencia:
         df_filtered = df_filtered[df_filtered['vigencia'].isin(selected_vigencia)]
     if filter_carousel == "Con carrusel":
-        df_filtered = df_filtered[df_filtered['has_product_carousel'] == True]
+        df_filtered = df_filtered[df_filtered['has_product_carousel'] ]
     elif filter_carousel == "Sin carrusel":
         df_filtered = df_filtered[df_filtered['has_product_carousel'] == False]
     if filter_alerts == "Con alertas":
-        df_filtered = df_filtered[df_filtered['has_alerts'] == True]
+        df_filtered = df_filtered[df_filtered['has_alerts'] ]
     elif filter_alerts == "Sin alertas":
         df_filtered = df_filtered[df_filtered['has_alerts'] == False]
     if filter_status != "Todos":
@@ -412,7 +541,9 @@ with st.sidebar:
             st.rerun()
     with col_btn2:
         if st.button("Cerrar sesión", use_container_width=True):
-            st.session_state['authenticated'] = False
+            st.session_state["authenticated"] = False
+            st.session_state["current_user"] = None
+            logger.info("User logged out")
             st.rerun()
 
 
@@ -461,8 +592,8 @@ with tab1:
 
     with col_chart1:
         cat_data = df_filtered[
-            df_filtered['categoria'].astype(str).str.strip() != ''
-        ]['categoria'].value_counts().reset_index()
+            non_empty_mask(df_filtered["categoria"])
+        ]["categoria"].value_counts().reset_index()
         cat_data.columns = ['Categoría', 'Artículos']
         if not cat_data.empty:
             cat_data = cat_data.sort_values('Artículos', ascending=True)
@@ -482,8 +613,8 @@ with tab1:
 
     with col_chart2:
         type_data = df_filtered[
-            df_filtered['tipo_contenido'].astype(str).str.strip() != ''
-        ]['tipo_contenido'].value_counts().reset_index()
+            non_empty_mask(df_filtered["tipo_contenido"])
+        ]["tipo_contenido"].value_counts().reset_index()
         type_data.columns = ['Tipo', 'Artículos']
         if not type_data.empty:
             fig_type = px.pie(
@@ -506,14 +637,14 @@ with tab1:
 
     with col_chart3:
         vig_data = df_filtered[
-            df_filtered['vigencia'].astype(str).str.strip() != ''
-        ]['vigencia'].value_counts().reset_index()
+            non_empty_mask(df_filtered["vigencia"])
+        ]["vigencia"].value_counts().reset_index()
         vig_data.columns = ['Vigencia', 'Artículos']
         if not vig_data.empty:
             color_map_vig = {
-                'evergreen': '#51CF66',
-                'evergreen_actualizable': '#F0A756',
-                'caduco': '#EF6C6C'
+                VIGENCIA_EVERGREEN: '#51CF66',
+                VIGENCIA_ACTUALIZABLE: '#F0A756',
+                VIGENCIA_CADUCO: '#EF6C6C',
             }
             fig_vig = px.bar(
                 vig_data, x='Vigencia', y='Artículos',
@@ -614,9 +745,7 @@ with tab3:
         st.info("No hay alertas registradas todavía. Se generarán con el workflow de alertas en n8n.")
     else:
         # Resolve boolean
-        df_alerts['_resolved'] = df_alerts['resolved'].apply(
-            lambda x: str(x).strip().upper() in ('TRUE', 'VERDADERO', '1', 'YES')
-        )
+        df_alerts['_resolved'] = df_alerts['resolved'].apply(parse_bool)
         df_alerts_active = df_alerts[~df_alerts['_resolved']].copy()
 
         # KPIs
@@ -626,17 +755,17 @@ with tab3:
             st.metric("Alertas activas", total_active)
         with kpi_a2:
             alta = int(
-                (df_alerts_active['severity'] == 'ALTA').sum()
+                (df_alerts_active['severity'] == SEVERITY_ALTA).sum()
             ) if 'severity' in df_alerts_active.columns else 0
             st.metric("Severidad ALTA", alta)
         with kpi_a3:
             media_count = int(
-                (df_alerts_active['severity'] == 'MEDIA').sum()
+                (df_alerts_active['severity'] == SEVERITY_MEDIA).sum()
             ) if 'severity' in df_alerts_active.columns else 0
             st.metric("Severidad MEDIA", media_count)
         with kpi_a4:
             baja = int(
-                (df_alerts_active['severity'] == 'BAJA').sum()
+                (df_alerts_active['severity'] == SEVERITY_BAJA).sum()
             ) if 'severity' in df_alerts_active.columns else 0
             st.metric("Severidad BAJA", baja)
 
@@ -656,9 +785,8 @@ with tab3:
                 ]
 
             # Sort by severity
-            severity_order = {'ALTA': 0, 'MEDIA': 1, 'BAJA': 2}
             if 'severity' in df_alerts_show.columns:
-                df_alerts_show['_sort'] = df_alerts_show['severity'].map(severity_order).fillna(3)
+                df_alerts_show['_sort'] = df_alerts_show['severity'].map(SEVERITY_ORDER).fillna(3)
                 df_alerts_show = df_alerts_show.sort_values('_sort')
 
             alert_display_cols = ['url', 'alert_type', 'severity', 'detail', 'detected_date']
@@ -741,8 +869,8 @@ with tab4:
 
     with col_a1:
         cat_counts = df_filtered[
-            df_filtered['categoria'].astype(str).str.strip() != ''
-        ]['categoria'].value_counts().reset_index()
+            non_empty_mask(df_filtered["categoria"])
+        ]["categoria"].value_counts().reset_index()
         cat_counts.columns = ['Categoría', 'Artículos']
         if not cat_counts.empty:
             cat_counts_sorted = cat_counts.sort_values('Artículos', ascending=True)
@@ -790,9 +918,7 @@ with tab4:
 
     with col_a3:
         if 'has_product_carousel' in df_filtered.columns and 'categoria' in df_filtered.columns:
-            df_cat_valid = df_filtered[
-                df_filtered['categoria'].astype(str).str.strip() != ''
-            ]
+            df_cat_valid = df_filtered[non_empty_mask(df_filtered["categoria"])]
             if not df_cat_valid.empty:
                 carousel_by_cat = df_cat_valid.groupby('categoria').agg(
                     total=('url', 'count'),
@@ -823,7 +949,7 @@ with tab4:
 
     with col_a4:
         df_old = df_filtered[
-            df_filtered['vigencia'].isin(['caduco', 'evergreen_actualizable'])
+            df_filtered['vigencia'].isin([VIGENCIA_CADUCO, VIGENCIA_ACTUALIZABLE])
         ].copy()
 
         if not df_old.empty and 'lastmod_parsed' in df_old.columns:
@@ -864,8 +990,8 @@ with tab4:
 
     # --- Row 3: Heatmap Category × Content Type ---
     df_heat = df_filtered[
-        (df_filtered['categoria'].astype(str).str.strip() != '') &
-        (df_filtered['tipo_contenido'].astype(str).str.strip() != '')
+        non_empty_mask(df_filtered["categoria"]) &
+        non_empty_mask(df_filtered["tipo_contenido"])
     ]
     if not df_heat.empty:
         cross = pd.crosstab(df_heat['categoria'], df_heat['tipo_contenido'])
