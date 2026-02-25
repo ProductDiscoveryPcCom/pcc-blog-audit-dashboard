@@ -424,6 +424,18 @@ def load_data():
             if date_col in df.columns:
                 df[f"{date_col}_parsed"] = pd.to_datetime(df[date_col], errors="coerce")
 
+        # --- Pre-compute non-empty masks (avoids repeated .astype(str).str.strip() per rerun) ---
+        for col in ("categoria", "subcategoria", "tipo_contenido", "vigencia"):
+            if col in df.columns:
+                df[f"_ne_{col}"] = df[col].astype(str).str.strip() != ""
+
+        # --- Pre-compute lowercase columns for fast text search ---
+        df["_url_lower"] = df["url"].astype(str).str.lower()
+        if "meta_title" in df.columns:
+            df["_title_lower"] = df["meta_title"].astype(str).str.lower()
+        if "sitemap_title" in df.columns:
+            df["_sitemap_lower"] = df["sitemap_title"].astype(str).str.lower()
+
     return df, df_alerts
 
 
@@ -455,30 +467,30 @@ with st.sidebar:
     st.markdown("##### Filtros")
 
     # Category
-    all_cats = sorted(df[non_empty_mask(df["categoria"])]["categoria"].unique().tolist())
+    all_cats = sorted(df.loc[df["_ne_categoria"], "categoria"].unique().tolist())
     selected_cats = st.multiselect("Categoría", all_cats, default=[])
 
     # Subcategory — dependent on selected categories
     if selected_cats:
         all_subcats = sorted(
-            df[(df["categoria"].isin(selected_cats)) & non_empty_mask(df["subcategoria"])]
-            ["subcategoria"].unique().tolist()
+            df.loc[df["categoria"].isin(selected_cats) & df["_ne_subcategoria"], "subcategoria"]
+            .unique().tolist()
         )
     else:
         all_subcats = sorted(
-            df[non_empty_mask(df["subcategoria"])]["subcategoria"].unique().tolist()
+            df.loc[df["_ne_subcategoria"], "subcategoria"].unique().tolist()
         )
     selected_subcats = st.multiselect("Subcategoría", all_subcats, default=[])
 
     # Content type
     all_types = sorted(
-        df[non_empty_mask(df["tipo_contenido"])]["tipo_contenido"].unique().tolist()
+        df.loc[df["_ne_tipo_contenido"], "tipo_contenido"].unique().tolist()
     )
     selected_types = st.multiselect("Tipo de contenido", all_types, default=[])
 
     # Vigencia
     all_vigencia = sorted(
-        df[non_empty_mask(df["vigencia"])]["vigencia"].unique().tolist()
+        df.loc[df["_ne_vigencia"], "vigencia"].unique().tolist()
     )
     selected_vigencia = st.multiselect("Vigencia", all_vigencia, default=[])
 
@@ -522,13 +534,12 @@ with st.sidebar:
         mask &= df['status_code'] == int(filter_status)
     if search_text:
         search_lower = search_text.lower()
-        mask &= (
-            df['url'].astype(str).str.lower().str.contains(search_lower, na=False) |
-            df.get('meta_title', pd.Series(dtype=str)).astype(str).str.lower().str.contains(
-                search_lower, na=False) |
-            df.get('sitemap_title', pd.Series(dtype=str)).astype(str).str.lower().str.contains(
-                search_lower, na=False)
-        )
+        search_mask = df['_url_lower'].str.contains(search_lower, na=False)
+        if '_title_lower' in df.columns:
+            search_mask |= df['_title_lower'].str.contains(search_lower, na=False)
+        if '_sitemap_lower' in df.columns:
+            search_mask |= df['_sitemap_lower'].str.contains(search_lower, na=False)
+        mask &= search_mask
     df_filtered = df.loc[mask]
 
     n_total = len(df)
@@ -553,27 +564,38 @@ with st.sidebar:
 
 
 # ══════════════════════════════════════════════════════════════
-# CACHED CHART HELPERS — avoid recomputing on every rerun
+# EXPORT HELPERS (module-level, cached — generated once per data change)
 # ══════════════════════════════════════════════════════════════
 @st.cache_data
+def _to_csv(data):
+    return data.to_csv(index=False).encode('utf-8')
+
+
+@st.cache_data
+def _to_excel(data):
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine='openpyxl') as writer:
+        data.to_excel(writer, index=False, sheet_name='URLs')
+    return buf.getvalue()
+
+
+# ══════════════════════════════════════════════════════════════
+# CHART HELPERS (plain functions — caching Series is slower than computing)
+# ══════════════════════════════════════════════════════════════
 def _value_counts(series):
-    """Cached value_counts returning a DataFrame with columns [value, count]."""
+    """Return value_counts as DataFrame with columns [value, count]."""
     vc = series.value_counts().reset_index()
     vc.columns = ['value', 'count']
     return vc
 
 
-@st.cache_data
 def _crosstab(idx_series, col_series):
-    """Cached crosstab."""
     return pd.crosstab(idx_series, col_series)
 
 
-@st.cache_data
-def _carousel_penetration(categories, carousel_flags, urls):
-    """Cached carousel penetration aggregation."""
-    tmp = pd.DataFrame({'categoria': categories, 'has_product_carousel': carousel_flags, 'url': urls})
-    agg = tmp.groupby('categoria').agg(
+def _carousel_penetration(df_subset):
+    """Compute carousel penetration by category."""
+    agg = df_subset.groupby('categoria').agg(
         total=('url', 'count'),
         con_carrusel=('has_product_carousel', 'sum')
     ).reset_index()
@@ -581,9 +603,8 @@ def _carousel_penetration(categories, carousel_flags, urls):
     return agg.sort_values('pct_carrusel', ascending=True)
 
 
-@st.cache_data
 def _timeline_data(pub_dates):
-    """Cached publication timeline aggregation."""
+    """Compute publication timeline aggregation."""
     s = pub_dates.dropna()
     if s.empty:
         return pd.DataFrame()
@@ -637,7 +658,7 @@ with tab1:
     col_chart1, col_chart2 = st.columns(2)
 
     with col_chart1:
-        _cat_vc = _value_counts(df_filtered[non_empty_mask(df_filtered["categoria"])]["categoria"])
+        _cat_vc = _value_counts(df_filtered.loc[df_filtered["_ne_categoria"], "categoria"])
         cat_data = _cat_vc.rename(columns={'value': 'Categoría', 'count': 'Artículos'})
         if not cat_data.empty:
             cat_data = cat_data.sort_values('Artículos', ascending=True)
@@ -656,7 +677,7 @@ with tab1:
             st.plotly_chart(fig_cat, use_container_width=True, config=PLOTLY_CONFIG)
 
     with col_chart2:
-        _type_vc = _value_counts(df_filtered[non_empty_mask(df_filtered["tipo_contenido"])]["tipo_contenido"])
+        _type_vc = _value_counts(df_filtered.loc[df_filtered["_ne_tipo_contenido"], "tipo_contenido"])
         type_data = _type_vc.rename(columns={'value': 'Tipo', 'count': 'Artículos'})
         if not type_data.empty:
             fig_type = px.pie(
@@ -678,7 +699,7 @@ with tab1:
     col_chart3, col_chart4 = st.columns(2)
 
     with col_chart3:
-        _vig_vc = _value_counts(df_filtered[non_empty_mask(df_filtered["vigencia"])]["vigencia"])
+        _vig_vc = _value_counts(df_filtered.loc[df_filtered["_ne_vigencia"], "vigencia"])
         vig_data = _vig_vc.rename(columns={'value': 'Vigencia', 'count': 'Artículos'})
         if not vig_data.empty:
             color_map_vig = {
@@ -759,17 +780,6 @@ with tab2:
     )
 
     # Export buttons
-    @st.cache_data
-    def _to_csv(data):
-        return data.to_csv(index=False).encode('utf-8')
-
-    @st.cache_data
-    def _to_excel(data):
-        buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine='openpyxl') as writer:
-            data.to_excel(writer, index=False, sheet_name='URLs')
-        return buf.getvalue()
-
     col_exp1, col_exp2, _ = st.columns([1, 1, 4])
     with col_exp1:
         st.download_button("Exportar CSV", _to_csv(df_filtered[available_cols]),
@@ -781,126 +791,131 @@ with tab2:
 
 
 # ══════════════════════════════════════════════════════════════
-# TAB 3: ALERTS
+# TAB 3: ALERTS — wrapped in @st.fragment so the internal
+#         multiselect filter does NOT trigger a full page rerun
 # ══════════════════════════════════════════════════════════════
-with tab3:
-
+@st.fragment
+def _render_alerts_tab(df_alerts_data):
     st.markdown('<div class="section-header">Panel de alertas</div>', unsafe_allow_html=True)
 
-    if df_alerts.empty:
+    if df_alerts_data.empty:
         st.info("No hay alertas registradas todavía. Se generarán con el workflow de alertas en n8n.")
+        return
+
+    # Resolve boolean (vectorized)
+    resolved_mask = df_alerts_data['resolved'].astype(str).str.strip().str.upper().isin(TRUTHY_VALUES)
+    df_alerts_active = df_alerts_data[~resolved_mask]
+
+    # KPIs
+    kpi_a1, kpi_a2, kpi_a3, kpi_a4 = st.columns(4)
+    total_active = len(df_alerts_active)
+    with kpi_a1:
+        st.metric("Alertas activas", total_active)
+    with kpi_a2:
+        alta = int(
+            (df_alerts_active['severity'] == SEVERITY_ALTA).sum()
+        ) if 'severity' in df_alerts_active.columns else 0
+        st.metric("Severidad ALTA", alta)
+    with kpi_a3:
+        media_count = int(
+            (df_alerts_active['severity'] == SEVERITY_MEDIA).sum()
+        ) if 'severity' in df_alerts_active.columns else 0
+        st.metric("Severidad MEDIA", media_count)
+    with kpi_a4:
+        baja = int(
+            (df_alerts_active['severity'] == SEVERITY_BAJA).sum()
+        ) if 'severity' in df_alerts_active.columns else 0
+        st.metric("Severidad BAJA", baja)
+
+    st.markdown("")
+
+    if df_alerts_active.empty or 'alert_type' not in df_alerts_active.columns:
+        st.success("No hay alertas activas. Todo en orden.")
+        return
+
+    # Filter by alert type (this widget only re-renders this fragment, not the whole page)
+    alert_types = sorted(df_alerts_active['alert_type'].unique().tolist())
+    selected_alert_type = st.multiselect(
+        "Filtrar por tipo de alerta", alert_types, default=[]
+    )
+
+    if selected_alert_type:
+        alert_mask = df_alerts_active['alert_type'].isin(selected_alert_type)
+        df_alerts_show = df_alerts_active[alert_mask]
     else:
-        # Resolve boolean (vectorized)
-        df_alerts['_resolved'] = df_alerts['resolved'].astype(str).str.strip().str.upper().isin(TRUTHY_VALUES)
-        df_alerts_active = df_alerts[~df_alerts['_resolved']].copy()
+        df_alerts_show = df_alerts_active
 
-        # KPIs
-        kpi_a1, kpi_a2, kpi_a3, kpi_a4 = st.columns(4)
-        total_active = len(df_alerts_active)
-        with kpi_a1:
-            st.metric("Alertas activas", total_active)
-        with kpi_a2:
-            alta = int(
-                (df_alerts_active['severity'] == SEVERITY_ALTA).sum()
-            ) if 'severity' in df_alerts_active.columns else 0
-            st.metric("Severidad ALTA", alta)
-        with kpi_a3:
-            media_count = int(
-                (df_alerts_active['severity'] == SEVERITY_MEDIA).sum()
-            ) if 'severity' in df_alerts_active.columns else 0
-            st.metric("Severidad MEDIA", media_count)
-        with kpi_a4:
-            baja = int(
-                (df_alerts_active['severity'] == SEVERITY_BAJA).sum()
-            ) if 'severity' in df_alerts_active.columns else 0
-            st.metric("Severidad BAJA", baja)
+    # Sort by severity
+    if 'severity' in df_alerts_show.columns:
+        sort_key = df_alerts_show['severity'].map(SEVERITY_ORDER).fillna(3)
+        df_alerts_show = df_alerts_show.iloc[sort_key.argsort()]
 
-        st.markdown("")
+    alert_display_cols = ['url', 'alert_type', 'severity', 'detail', 'detected_date']
+    alert_available = [c for c in alert_display_cols if c in df_alerts_show.columns]
 
-        if not df_alerts_active.empty and 'alert_type' in df_alerts_active.columns:
-            # Filter by alert type
-            alert_types = sorted(df_alerts_active['alert_type'].unique().tolist())
-            selected_alert_type = st.multiselect(
-                "Filtrar por tipo de alerta", alert_types, default=[]
+    st.dataframe(
+        df_alerts_show[alert_available],
+        use_container_width=True,
+        height=480,
+        column_config={
+            "url": st.column_config.LinkColumn("URL", width="large"),
+            "alert_type": st.column_config.TextColumn("Tipo"),
+            "severity": st.column_config.TextColumn("Severidad"),
+            "detail": st.column_config.TextColumn("Detalle", width="large"),
+            "detected_date": st.column_config.TextColumn("Detectada"),
+        }
+    )
+
+    st.markdown("")
+
+    # Charts side by side
+    col_al1, col_al2 = st.columns(2)
+
+    with col_al1:
+        _abt_vc = _value_counts(df_alerts_active['alert_type'])
+        alert_breakdown = _abt_vc.rename(columns={'value': 'Tipo', 'count': 'Cantidad'})
+        if not alert_breakdown.empty:
+            fig_alerts = px.bar(
+                alert_breakdown.sort_values('Cantidad', ascending=True),
+                x='Cantidad', y='Tipo', orientation='h',
+                title='Alertas por tipo',
+                text='Cantidad',
+                color_discrete_sequence=['#EF6C6C']
             )
-
-            df_alerts_show = df_alerts_active.copy()
-            if selected_alert_type:
-                df_alerts_show = df_alerts_show[
-                    df_alerts_show['alert_type'].isin(selected_alert_type)
-                ]
-
-            # Sort by severity
-            if 'severity' in df_alerts_show.columns:
-                df_alerts_show['_sort'] = df_alerts_show['severity'].map(SEVERITY_ORDER).fillna(3)
-                df_alerts_show = df_alerts_show.sort_values('_sort')
-
-            alert_display_cols = ['url', 'alert_type', 'severity', 'detail', 'detected_date']
-            alert_available = [c for c in alert_display_cols if c in df_alerts_show.columns]
-
-            st.dataframe(
-                df_alerts_show[alert_available],
-                use_container_width=True,
-                height=480,
-                column_config={
-                    "url": st.column_config.LinkColumn("URL", width="large"),
-                    "alert_type": st.column_config.TextColumn("Tipo"),
-                    "severity": st.column_config.TextColumn("Severidad"),
-                    "detail": st.column_config.TextColumn("Detalle", width="large"),
-                    "detected_date": st.column_config.TextColumn("Detectada"),
-                }
+            fig_alerts.update_traces(textposition='outside', textfont=dict(size=11))
+            fig_alerts.update_layout(xaxis_title='', yaxis_title='')
+            apply_metabase_style(
+                fig_alerts,
+                height=max(280, len(alert_breakdown) * 32 + 60)
             )
+            st.plotly_chart(fig_alerts, use_container_width=True, config=PLOTLY_CONFIG)
 
-            st.markdown("")
+    with col_al2:
+        if 'severity' in df_alerts_active.columns:
+            _sev_vc = _value_counts(df_alerts_active['severity'])
+            sev_data = _sev_vc.rename(columns={'value': 'Severidad', 'count': 'Cantidad'})
+            sev_color_map = {
+                'ALTA': '#EF6C6C', 'MEDIA': '#F0A756', 'BAJA': '#4C9AFF'
+            }
+            sev_colors = [
+                sev_color_map.get(s, '#64748B') for s in sev_data['Severidad']
+            ]
+            fig_sev = px.pie(
+                sev_data, names='Severidad', values='Cantidad',
+                title='Alertas por severidad',
+                hole=0.5,
+            )
+            fig_sev.update_traces(
+                marker=dict(colors=sev_colors),
+                textinfo='label+value+percent',
+                textposition='outside'
+            )
+            apply_metabase_style(fig_sev, height=320)
+            st.plotly_chart(fig_sev, use_container_width=True, config=PLOTLY_CONFIG)
 
-            # Charts side by side
-            col_al1, col_al2 = st.columns(2)
 
-            with col_al1:
-                # Alert type breakdown
-                _abt_vc = _value_counts(df_alerts_active['alert_type'])
-                alert_breakdown = _abt_vc.rename(columns={'value': 'Tipo', 'count': 'Cantidad'})
-                if not alert_breakdown.empty:
-                    fig_alerts = px.bar(
-                        alert_breakdown.sort_values('Cantidad', ascending=True),
-                        x='Cantidad', y='Tipo', orientation='h',
-                        title='Alertas por tipo',
-                        text='Cantidad',
-                        color_discrete_sequence=['#EF6C6C']
-                    )
-                    fig_alerts.update_traces(textposition='outside', textfont=dict(size=11))
-                    fig_alerts.update_layout(xaxis_title='', yaxis_title='')
-                    apply_metabase_style(
-                        fig_alerts,
-                        height=max(280, len(alert_breakdown) * 32 + 60)
-                    )
-                    st.plotly_chart(fig_alerts, use_container_width=True, config=PLOTLY_CONFIG)
-
-            with col_al2:
-                # Severity donut
-                if 'severity' in df_alerts_active.columns:
-                    _sev_vc = _value_counts(df_alerts_active['severity'])
-                    sev_data = _sev_vc.rename(columns={'value': 'Severidad', 'count': 'Cantidad'})
-                    sev_color_map = {
-                        'ALTA': '#EF6C6C', 'MEDIA': '#F0A756', 'BAJA': '#4C9AFF'
-                    }
-                    sev_colors = [
-                        sev_color_map.get(s, '#64748B') for s in sev_data['Severidad']
-                    ]
-                    fig_sev = px.pie(
-                        sev_data, names='Severidad', values='Cantidad',
-                        title='Alertas por severidad',
-                        hole=0.5,
-                    )
-                    fig_sev.update_traces(
-                        marker=dict(colors=sev_colors),
-                        textinfo='label+value+percent',
-                        textposition='outside'
-                    )
-                    apply_metabase_style(fig_sev, height=320)
-                    st.plotly_chart(fig_sev, use_container_width=True, config=PLOTLY_CONFIG)
-        else:
-            st.success("No hay alertas activas. Todo en orden.")
+with tab3:
+    _render_alerts_tab(df_alerts)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -914,7 +929,7 @@ with tab4:
     col_a1, col_a2 = st.columns(2)
 
     with col_a1:
-        _gap_vc = _value_counts(df_filtered[non_empty_mask(df_filtered["categoria"])]["categoria"])
+        _gap_vc = _value_counts(df_filtered.loc[df_filtered["_ne_categoria"], "categoria"])
         cat_counts = _gap_vc.rename(columns={'value': 'Categoría', 'count': 'Artículos'})
         if not cat_counts.empty:
             cat_counts_sorted = cat_counts.sort_values('Artículos', ascending=True)
@@ -962,11 +977,9 @@ with tab4:
 
     with col_a3:
         if 'has_product_carousel' in df_filtered.columns and 'categoria' in df_filtered.columns:
-            df_cat_valid = df_filtered[non_empty_mask(df_filtered["categoria"])]
+            df_cat_valid = df_filtered[df_filtered["_ne_categoria"]]
             if not df_cat_valid.empty:
-                carousel_by_cat = _carousel_penetration(
-                    df_cat_valid['categoria'], df_cat_valid['has_product_carousel'], df_cat_valid['url']
-                )
+                carousel_by_cat = _carousel_penetration(df_cat_valid)
 
                 fig_carousel = px.bar(
                     carousel_by_cat, x='pct_carrusel', y='categoria', orientation='h',
@@ -1029,8 +1042,7 @@ with tab4:
 
     # --- Row 3: Heatmap Category × Content Type ---
     df_heat = df_filtered[
-        non_empty_mask(df_filtered["categoria"]) &
-        non_empty_mask(df_filtered["tipo_contenido"])
+        df_filtered["_ne_categoria"] & df_filtered["_ne_tipo_contenido"]
     ]
     if not df_heat.empty:
         cross = _crosstab(df_heat['categoria'], df_heat['tipo_contenido'])
