@@ -6,7 +6,7 @@ from google.oauth2.service_account import Credentials
 import json
 import hashlib
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 import io
 
 # ══════════════════════════════════════════════════════════════
@@ -327,7 +327,6 @@ if not st.session_state["authenticated"]:
                 attempts = st.session_state["login_attempts"]
                 logger.warning("Failed login attempt #%d for user '%s'", attempts, username)
                 if attempts >= MAX_LOGIN_ATTEMPTS:
-                    from datetime import timedelta
                     st.session_state["lockout_until"] = now + timedelta(seconds=LOGIN_LOCKOUT_SECONDS)
                     st.error(f"Demasiados intentos. Bloqueado durante {LOGIN_LOCKOUT_SECONDS // 60} minutos.")
                 else:
@@ -501,6 +500,24 @@ with st.sidebar:
     # Text search
     search_text = st.text_input("Buscar en título / URL", "", placeholder="Escribe para filtrar...")
 
+    # Date range filters
+    if 'pub_date_parsed' in df.columns:
+        valid_dates = df['pub_date_parsed'].dropna()
+        if not valid_dates.empty:
+            min_date = valid_dates.min().date()
+            max_date = valid_dates.max().date()
+            date_range = st.date_input(
+                "Rango de publicación",
+                value=[],
+                min_value=min_date,
+                max_value=max_date,
+                key="pub_date_range"
+            )
+        else:
+            date_range = []
+    else:
+        date_range = []
+
     st.markdown("---")
 
     # Apply filters — build a single boolean mask instead of copying df repeatedly
@@ -513,14 +530,16 @@ with st.sidebar:
         mask &= df['tipo_contenido'].isin(selected_types)
     if selected_vigencia:
         mask &= df['vigencia'].isin(selected_vigencia)
-    if filter_carousel == "Con carrusel":
-        mask &= df['has_product_carousel']
-    elif filter_carousel == "Sin carrusel":
-        mask &= ~df['has_product_carousel']
-    if filter_alerts == "Con alertas":
-        mask &= df['has_alerts']
-    elif filter_alerts == "Sin alertas":
-        mask &= ~df['has_alerts']
+    if 'has_product_carousel' in df.columns:
+        if filter_carousel == "Con carrusel":
+            mask &= df['has_product_carousel']
+        elif filter_carousel == "Sin carrusel":
+            mask &= ~df['has_product_carousel']
+    if 'has_alerts' in df.columns:
+        if filter_alerts == "Con alertas":
+            mask &= df['has_alerts']
+        elif filter_alerts == "Sin alertas":
+            mask &= ~df['has_alerts']
     if filter_status != "Todos":
         mask &= df['status_code'] == int(filter_status)
     if search_text:
@@ -531,6 +550,9 @@ with st.sidebar:
         if '_sitemap_lower' in df.columns:
             search_mask |= df['_sitemap_lower'].str.contains(search_lower, na=False)
         mask &= search_mask
+    if len(date_range) == 2 and 'pub_date_parsed' in df.columns:
+        mask &= (df['pub_date_parsed'] >= pd.Timestamp(date_range[0])) & \
+                (df['pub_date_parsed'] <= pd.Timestamp(date_range[1]))
     df_filtered = df.loc[mask]
 
     n_total = len(df)
@@ -544,7 +566,8 @@ with st.sidebar:
     col_btn1, col_btn2 = st.columns(2)
     with col_btn1:
         if st.button("↻ Recargar", use_container_width=True):
-            st.cache_data.clear()
+            with st.spinner("Recargando datos…"):
+                st.cache_data.clear()
             st.rerun()
     with col_btn2:
         if st.button("Cerrar sesión", use_container_width=True):
@@ -839,6 +862,17 @@ def _render_alerts_tab(df_alerts_data):
         }
     )
 
+    # Export buttons for alerts
+    col_aexp1, col_aexp2, _ = st.columns([1, 1, 4])
+    with col_aexp1:
+        st.download_button("Exportar CSV", _to_csv(df_alerts_show[alert_available]),
+                           "alertas_export.csv", "text/csv", key="alerts_csv")
+    with col_aexp2:
+        st.download_button("Exportar Excel", _to_excel(df_alerts_show[alert_available]),
+                           "alertas_export.xlsx",
+                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           key="alerts_xlsx")
+
     st.markdown("")
 
     # Charts side by side
@@ -978,11 +1012,17 @@ elif active_tab == "Análisis":
                 "modificación (más antiguos primero)"
             )
 
+            n_old = len(df_old)
+            max_show = st.slider(
+                "Nº de artículos a mostrar", 10, min(n_old, 100), min(25, n_old),
+                key="old_content_slider"
+            )
+
             old_display = ['url', 'meta_title', 'vigencia', 'lastmod', 'categoria']
             old_available = [c for c in old_display if c in df_old.columns]
 
             st.dataframe(
-                df_old[old_available].head(25),
+                df_old[old_available].head(max_show),
                 use_container_width=True,
                 height=420,
                 column_config={
