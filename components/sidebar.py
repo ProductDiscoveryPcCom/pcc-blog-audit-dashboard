@@ -1,8 +1,12 @@
 """
 Sidebar component — Optimización 2: separar selección de aplicación.
 
-Widgets write to ``st.session_state["pending_filters"]``.
-The "Aplicar filtros" button snapshots pending → applied and invalidates caches.
+Pattern: widgets own their state via ``key``. We never pass ``default``/
+``value``/``index`` together with ``key`` — that causes the Streamlit
+"default value vs Session State API" conflict.  Instead we:
+  1. Seed ``st.session_state[widget_key]`` ONCE (first run only).
+  2. Let the widget read/write its own key freely.
+  3. After all widgets render, sync their values → ``pending_filters``.
 """
 
 import streamlit as st
@@ -13,6 +17,13 @@ from state import apply_filters, mark_dirty
 logger = logging.getLogger(__name__)
 
 
+# ── Helpers ─────────────────────────────────────────────────────
+def _seed(key, default):
+    """Set a widget key only if it doesn't exist yet (first run)."""
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+
 def render_sidebar(df: pd.DataFrame):
     """Render the full sidebar.  Returns nothing — state lives in session_state."""
     with st.sidebar:
@@ -21,68 +32,76 @@ def render_sidebar(df: pd.DataFrame):
         st.markdown("---")
         st.markdown("##### Filtros")
 
-        pf = st.session_state["pending_filters"]
+        # ── Seed widget keys on very first run ──────────────────
+        _seed("w_cats", [])
+        _seed("w_subcats", [])
+        _seed("w_types", [])
+        _seed("w_vig", [])
+        _seed("w_carousel", "Todos")
+        _seed("w_alerts", "Todos")
+        _seed("w_status", "Todos")
+        _seed("w_search", "")
+        # w_dates is seeded below (needs valid date bounds first)
 
         # ── Category ────────────────────────────────────────────
         all_cats = sorted(df.loc[df["_ne_categoria"], "categoria"].unique().tolist())
-        pf["categorias"] = st.multiselect(
+        st.multiselect(
             "Categoría", all_cats,
-            default=pf.get("categorias", []),
             key="w_cats",
             on_change=mark_dirty,
         )
 
-        # ── Subcategory (dependent) ────────────────────────────
-        if pf["categorias"]:
+        # ── Subcategory (dependent on selected categories) ──────
+        selected_cats = st.session_state["w_cats"]
+        if selected_cats:
             pool = df.loc[
-                df["categoria"].isin(pf["categorias"]) & df["_ne_subcategoria"],
+                df["categoria"].isin(selected_cats) & df["_ne_subcategoria"],
                 "subcategoria",
             ]
         else:
             pool = df.loc[df["_ne_subcategoria"], "subcategoria"]
         all_subcats = sorted(pool.unique().tolist())
 
-        # Keep only still‑valid defaults
-        valid_sub = [s for s in pf.get("subcategorias", []) if s in all_subcats]
-        pf["subcategorias"] = st.multiselect(
+        # Prune stale subcategory selections that are no longer valid
+        current_sub = st.session_state.get("w_subcats", [])
+        valid_sub = [s for s in current_sub if s in all_subcats]
+        if valid_sub != current_sub:
+            st.session_state["w_subcats"] = valid_sub
+
+        st.multiselect(
             "Subcategoría", all_subcats,
-            default=valid_sub,
             key="w_subcats",
             on_change=mark_dirty,
         )
 
         # ── Content type ────────────────────────────────────────
         all_types = sorted(df.loc[df["_ne_tipo_contenido"], "tipo_contenido"].unique().tolist())
-        pf["tipos_contenido"] = st.multiselect(
+        st.multiselect(
             "Tipo de contenido", all_types,
-            default=pf.get("tipos_contenido", []),
             key="w_types",
             on_change=mark_dirty,
         )
 
         # ── Vigencia ────────────────────────────────────────────
         all_vig = sorted(df.loc[df["_ne_vigencia"], "vigencia"].unique().tolist())
-        pf["vigencia"] = st.multiselect(
+        st.multiselect(
             "Vigencia", all_vig,
-            default=pf.get("vigencia", []),
             key="w_vig",
             on_change=mark_dirty,
         )
 
         # ── Carousel ────────────────────────────────────────────
         carousel_opts = ["Todos", "Con carrusel", "Sin carrusel"]
-        pf["carousel"] = st.selectbox(
+        st.selectbox(
             "Carrusel de producto", carousel_opts,
-            index=carousel_opts.index(pf.get("carousel", "Todos")),
             key="w_carousel",
             on_change=mark_dirty,
         )
 
         # ── Alerts ──────────────────────────────────────────────
         alert_opts = ["Todos", "Con alertas", "Sin alertas"]
-        pf["alertas"] = st.selectbox(
+        st.selectbox(
             "Alertas", alert_opts,
-            index=alert_opts.index(pf.get("alertas", "Todos")),
             key="w_alerts",
             on_change=mark_dirty,
         )
@@ -90,18 +109,20 @@ def render_sidebar(df: pd.DataFrame):
         # ── Status code ────────────────────────────────────────
         all_status = sorted(df["status_code"].unique().tolist())
         status_opts = ["Todos"] + [str(s) for s in all_status]
-        current_status = pf.get("status_code", "Todos")
-        idx = status_opts.index(current_status) if current_status in status_opts else 0
-        pf["status_code"] = st.selectbox(
+
+        # Prune stale status selection
+        if st.session_state["w_status"] not in status_opts:
+            st.session_state["w_status"] = "Todos"
+
+        st.selectbox(
             "Status code", status_opts,
-            index=idx,
             key="w_status",
             on_change=mark_dirty,
         )
 
         # ── Text search ────────────────────────────────────────
-        pf["search_text"] = st.text_input(
-            "Buscar en título / URL", pf.get("search_text", ""),
+        st.text_input(
+            "Buscar en título / URL",
             placeholder="Escribe para filtrar…",
             key="w_search",
             on_change=mark_dirty,
@@ -111,9 +132,9 @@ def render_sidebar(df: pd.DataFrame):
         if "pub_date_parsed" in df.columns:
             valid_dates = df["pub_date_parsed"].dropna()
             if not valid_dates.empty:
-                pf["date_range"] = st.date_input(
+                _seed("w_dates", [])
+                st.date_input(
                     "Rango de publicación",
-                    value=pf.get("date_range", []),
                     min_value=valid_dates.min().date(),
                     max_value=valid_dates.max().date(),
                     key="w_dates",
@@ -121,6 +142,20 @@ def render_sidebar(df: pd.DataFrame):
                 )
 
         st.markdown("---")
+
+        # ═══════════════════════════════════════════════════════
+        # Sync widget values → pending_filters (single source of truth)
+        # ═══════════════════════════════════════════════════════
+        pf = st.session_state["pending_filters"]
+        pf["categorias"] = st.session_state["w_cats"]
+        pf["subcategorias"] = st.session_state["w_subcats"]
+        pf["tipos_contenido"] = st.session_state["w_types"]
+        pf["vigencia"] = st.session_state["w_vig"]
+        pf["carousel"] = st.session_state["w_carousel"]
+        pf["alertas"] = st.session_state["w_alerts"]
+        pf["status_code"] = st.session_state["w_status"]
+        pf["search_text"] = st.session_state["w_search"]
+        pf["date_range"] = st.session_state.get("w_dates", [])
 
         # ── Apply button (Optimización 2 core) ─────────────────
         is_dirty = st.session_state.get("filters_dirty", False)
